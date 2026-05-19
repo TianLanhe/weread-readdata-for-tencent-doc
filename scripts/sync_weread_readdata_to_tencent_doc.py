@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import concurrent.futures
 import datetime as dt
 import json
@@ -61,6 +62,15 @@ MULTI_OPTION_FIELDS = {"分类", "一级分类"}
 OPTION_LIKE_FIELDS = {"是否可读", "是否已读完", "已读完年", "已读完年月"}
 DATE_FIELDS = {"阅读完成时间"}
 FETCH_EXISTING_FIELDS = ["bookId"]
+IMAGE_CONTENT_TYPE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+}
 
 
 def eprint(*args):
@@ -287,7 +297,7 @@ def make_field_value(field_name, value, field_types, warnings):
         else:
             entry["url_value"] = {"items": []}
     elif field_type == "image":
-        if isinstance(value, str) and value.startswith("image_"):
+        if isinstance(value, str) and value and not value.startswith("http"):
             entry["image_value"] = {"items": [{"image_id": value}]}
         else:
             warnings.add("字段“封面”为 image 类型，但微信读书只返回封面 URL；未写入封面图片字段。")
@@ -433,6 +443,10 @@ def get_book_progress(book_id):
     return weread_call({"api_name": "/book/getprogress", "bookId": book_id})
 
 
+def get_book_chapterinfo(book_id):
+    return weread_call({"api_name": "/book/chapterinfo", "bookId": book_id})
+
+
 def batch_get_book_details(book_ids, max_workers=10):
     details = {}
     if not book_ids:
@@ -462,16 +476,75 @@ def batch_get_book_progresses(book_ids, max_workers=10):
     return progresses
 
 
+def batch_get_book_chapterinfos(book_ids, max_workers=10):
+    chapter_infos = {}
+    if not book_ids:
+        return chapter_infos
+    workers = max(1, int(max_workers or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_book = {executor.submit(get_book_chapterinfo, book_id): book_id for book_id in book_ids}
+        for future in concurrent.futures.as_completed(future_to_book):
+            book_id = future_to_book[future]
+            try:
+                chapter_infos[book_id] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                chapter_infos[book_id] = {"error": str(exc)}
+    return chapter_infos
+
+
+def extract_titles(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        titles = []
+        for item in value:
+            titles.extend(extract_titles(item))
+        return titles
+    if isinstance(value, dict):
+        for key in ("title", "name", "category", "label", "text", "value"):
+            if value.get(key):
+                return extract_titles(value.get(key))
+        return []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def expand_category_value(value):
+    expanded = []
+    seen = set()
+    for title in extract_titles(value):
+        parts = [part.strip() for part in re.split(r"\s*-\s*", title) if part and part.strip()]
+        candidates = parts if len(parts) > 1 else [title]
+        for item in candidates:
+            if item not in seen:
+                expanded.append(item)
+                seen.add(item)
+    return expanded
+
+
 def get_category_titles(item):
     categories = []
-    for cat in item.get("categories") or []:
-        title = cat.get("title") if isinstance(cat, dict) else str(cat)
-        if title:
-            categories.append(title)
-    category = item.get("category")
-    if category and category not in categories:
-        categories.append(category)
-    return categories
+    first_levels = []
+    seen_categories = set()
+    seen_first_levels = set()
+    if not isinstance(item, dict):
+        return categories, first_levels
+    for key in ("categories", "category", "subCategories", "subCategory", "categoryText", "classify", "classification"):
+        value = item.get(key)
+        if value is None:
+            continue
+        expanded = expand_category_value(value)
+        if not expanded:
+            continue
+        first = expanded[0]
+        if first and first not in seen_first_levels:
+            first_levels.append(first)
+            seen_first_levels.add(first)
+        for category in expanded:
+            if category and category not in seen_categories:
+                categories.append(category)
+                seen_categories.add(category)
+    return categories, first_levels
 
 
 def first_level_categories(categories):
@@ -483,6 +556,140 @@ def first_level_categories(categories):
             result.append(first)
             seen.add(first)
     return result
+
+
+def value_from_paths(data, *paths):
+    if not isinstance(data, dict):
+        return None
+    for path in paths:
+        current = data
+        found = True
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                found = False
+                break
+            current = current.get(part)
+        if found:
+            return current
+    return None
+
+
+def any_truthy(data, *paths):
+    value = value_from_paths(data, *paths)
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "paid", "member", "vip", "on", "open", "available", "support"}
+    return bool(value)
+
+
+def detect_user_is_paid_member(*sources):
+    for env_name in ("WEREAD_IS_PAID_MEMBER", "WEREAD_MEMBER_ACTIVE", "WEREAD_VIP_ACTIVE"):
+        env_value = os.environ.get(env_name)
+        if env_value is not None and str(env_value).strip() != "":
+            return string_to_bool(env_value)
+    member_paths = (
+        "isMember",
+        "isVip",
+        "member",
+        "vip",
+        "memberActive",
+        "vipActive",
+        "memberInfo.isActive",
+        "vipInfo.isActive",
+        "user.isMember",
+        "user.isVip",
+    )
+    for source in sources:
+        if any(any_truthy(source, path) for path in member_paths):
+            return True
+    return False
+
+
+def infer_can_read(item, detail=None, chapter_info=None, user_is_paid_member=False):
+    if user_is_paid_member:
+        return True
+    detail = detail or {}
+    chapter_info = chapter_info or {}
+
+    explicit_free_paths = (
+        "free",
+        "isFree",
+        "freeRead",
+        "isFreeRead",
+        "supportFreeRead",
+        "canFreeRead",
+    )
+    explicit_card_paths = (
+        "experienceCardReadable",
+        "isExperienceCardReadable",
+        "supportExperienceCardRead",
+        "supportExperienceCard",
+        "canUseExperienceCard",
+        "trialRead",
+        "isTrialRead",
+    )
+    explicit_purchased_paths = (
+        "paid",
+        "isPaid",
+        "bought",
+        "isBought",
+        "purchased",
+        "isPurchased",
+        "hasPurchased",
+    )
+    for source in (item or {}, detail):
+        if any(any_truthy(source, path) for path in explicit_free_paths):
+            return True
+        if any(any_truthy(source, path) for path in explicit_card_paths):
+            return True
+        if any(any_truthy(source, path) for path in explicit_purchased_paths):
+            return True
+
+    chapters = (chapter_info or {}).get("chapters") or []
+    if chapters:
+        priced_chapters = [chapter for chapter in chapters if int(chapter.get("price") or 0) != 0]
+        if not priced_chapters:
+            return True
+        return all(int(chapter.get("paid") or 0) == 1 for chapter in priced_chapters)
+
+    return False
+
+
+def guess_image_file_name(url, content_type=None):
+    parsed = parse.urlparse(url or "")
+    basename = os.path.basename(parsed.path or "") or "cover"
+    root, ext = os.path.splitext(basename)
+    ext = ext.lower()
+    if not ext:
+        ext = IMAGE_CONTENT_TYPE_EXTENSIONS.get((content_type or "").split(";")[0].strip().lower(), ".jpg")
+    return f"{root or 'cover'}{ext}"
+
+
+def upload_image_from_url(url, image_upload_cache=None):
+    if not url:
+        return ""
+    cache = image_upload_cache if image_upload_cache is not None else {}
+    if url in cache:
+        return cache[url]
+    req = request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
+        binary = resp.read()
+        content_type = resp.headers.get("Content-Type", "")
+    if not binary:
+        raise RuntimeError(f"empty image body: {url}")
+    file_name = guess_image_file_name(url, content_type=content_type)
+    data = tencent_json("upload_image", {
+        "image_base64": base64.b64encode(binary).decode("ascii"),
+        "file_name": file_name,
+    })
+    image_id = data.get("image_id") or data.get("id") or ""
+    if not image_id:
+        raise RuntimeError(f"upload_image returned no image_id for {url}")
+    cache[url] = image_id
+    return image_id
 
 
 def format_read_time(seconds):
@@ -563,8 +770,9 @@ def finish_year_month(finish_time_ms):
     return dt.datetime.fromtimestamp(int(finish_time_ms) / 1000).strftime("%Y年%m月")
 
 
-def build_books_from_weread(shelf, details, finished_books, progresses=None):
+def build_books_from_weread(shelf, details, finished_books, progresses=None, chapter_infos=None, user_is_paid_member=False):
     progresses = progresses or {}
+    chapter_infos = chapter_infos or {}
     book_progress = {}
     for progress in shelf.get("bookProgress") or []:
         book_id = str(progress.get("bookId") or "")
@@ -590,10 +798,11 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None):
             continue
         detail = details.get(book_id) or {}
         progress_detail = progress_book(progresses, book_id)
+        chapter_info = chapter_infos.get(book_id) or {}
         merged_progress = {**(book_progress.get(book_id) or {}), **progress_detail}
-        categories = get_category_titles(item)
+        categories, first_level = get_category_titles(item)
         if not categories:
-            categories = get_category_titles(detail)
+            categories, first_level = get_category_titles(detail)
         read_time = int(first_number(merged_progress.get("readingTime"), merged_progress.get("recordReadingTime")) or 0)
         progress = min(max(first_number(merged_progress.get("progress")) or 0, 0), 100) / 100
         finish_time_ms = finish_times.get(book_id, 0)
@@ -604,7 +813,7 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None):
             progress = 1
         score = normalize_rating(detail.get("newRating"))
         words = normalize_words(detail.get("totalWords"), detail.get("wordCount"))
-        can_read = item.get("paid") == 1 or item.get("payingStatus") != 2
+        can_read = infer_can_read(item, detail=detail, chapter_info=chapter_info, user_is_paid_member=user_is_paid_member)
         rows[book_id] = book_to_row(
             book_id=book_id,
             title=item.get("title") or detail.get("title") or "",
@@ -613,6 +822,7 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None):
             price=normalize_price(item.get("price"), detail.get("price")),
             can_read=can_read,
             categories=categories,
+            first_level_categories_value=first_level,
             read_time=read_time,
             shelf_name=shelf_names.get(book_id, ""),
             score=score,
@@ -627,7 +837,8 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None):
         if book_id in rows:
             continue
         detail = details.get(book_id) or {}
-        categories = get_category_titles(detail)
+        chapter_info = chapter_infos.get(book_id) or {}
+        categories, first_level = get_category_titles(detail)
         read_time = int(item.get("readtime") or 0)
         finish_time_ms = int(item.get("finishTime") or 0) * 1000
         score = normalize_rating(detail.get("newRating"))
@@ -638,8 +849,9 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None):
             author=item.get("author") or detail.get("author") or "",
             cover=item.get("cover") or detail.get("cover") or "",
             price=normalize_price(detail.get("price")),
-            can_read=True,
+            can_read=infer_can_read(item, detail=detail, chapter_info=chapter_info, user_is_paid_member=user_is_paid_member),
             categories=categories,
+            first_level_categories_value=first_level,
             read_time=read_time,
             shelf_name="",
             score=score,
@@ -652,7 +864,7 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None):
     return rows
 
 
-def book_to_row(book_id, title, author, cover, price, can_read, categories, read_time, shelf_name, score, intro, words, progress, finish_time_ms, is_finished=None):
+def book_to_row(book_id, title, author, cover, price, can_read, categories, read_time, shelf_name, score, intro, words, progress, finish_time_ms, is_finished=None, first_level_categories_value=None):
     read_time = int(read_time or 0)
     finish_read = bool(is_finished) if is_finished is not None else finish_time_ms > 0
     return {
@@ -662,7 +874,7 @@ def book_to_row(book_id, title, author, cover, price, can_read, categories, read
         "价格": price,
         "作者": author,
         "分类": categories or [],
-        "一级分类": first_level_categories(categories),
+        "一级分类": first_level_categories_value or first_level_categories(categories),
         "是否可读": yes_no(can_read),
         "评分": score,
         "阅读时长（秒）": read_time,
@@ -700,14 +912,32 @@ def extract_book_rows(max_workers=10):
             seen.add(book_id)
     details = batch_get_book_details(book_ids, max_workers=max_workers)
     progresses = batch_get_book_progresses(book_ids, max_workers=max_workers)
-    rows_by_id = build_books_from_weread(shelf, details, finished_books, progresses=progresses)
+    chapter_infos = batch_get_book_chapterinfos(book_ids, max_workers=max_workers)
+    user_is_paid_member = detect_user_is_paid_member(shelf, details, finished_books, progresses)
+    rows_by_id = build_books_from_weread(
+        shelf,
+        details,
+        finished_books,
+        progresses=progresses,
+        chapter_infos=chapter_infos,
+        user_is_paid_member=user_is_paid_member,
+    )
     return [rows_by_id[key] for key in sorted(rows_by_id, key=lambda k: rows_by_id[k].get("书名") or k)]
 
 
-def payload_for_row(row, field_types, warnings):
+def payload_for_row(row, field_types, warnings, upload_images=False, image_upload_cache=None):
     values = []
     for field in REQUIRED_FIELDS:
-        entry = make_field_value(field, row.get(field), field_types, warnings)
+        value = row.get(field)
+        if field == "封面" and upload_images:
+            field_type = (field_types.get(field) or {}).get("type")
+            if field_type == "image" and isinstance(value, str) and value.startswith("http"):
+                try:
+                    value = upload_image_from_url(value, image_upload_cache=image_upload_cache)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.add(f"字段“封面”图片上传失败：{exc}")
+                    continue
+        entry = make_field_value(field, value, field_types, warnings)
         if entry is not None:
             values.append(entry)
     return values
@@ -757,6 +987,7 @@ def upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=False, d
         "warnings": [],
     }
     warning_set = set()
+    image_upload_cache = {}
     rows_to_create = []
     rows_to_update = []
     record_ids_to_delete = []
@@ -769,16 +1000,23 @@ def upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=False, d
                 record_id = existing[book_id].get("record_id")
                 if record_id:
                     record_ids_to_delete.append(record_id)
-                rows_to_create.append({"field_values": payload_for_row(row, field_types, warning_set)})
+                rows_to_create.append({
+                    "field_values": payload_for_row(row, field_types, warning_set, upload_images=not dry_run, image_upload_cache=image_upload_cache),
+                })
                 continue
             if not row_changed(existing[book_id]["fields"], row):
                 summary["skipped"] += 1
                 continue
             record_id = existing[book_id].get("record_id")
             if record_id:
-                rows_to_update.append({"record_id": record_id, "field_values": payload_for_row(row, field_types, warning_set)})
+                rows_to_update.append({
+                    "record_id": record_id,
+                    "field_values": payload_for_row(row, field_types, warning_set, upload_images=not dry_run, image_upload_cache=image_upload_cache),
+                })
         else:
-            rows_to_create.append({"field_values": payload_for_row(row, field_types, warning_set)})
+            rows_to_create.append({
+                "field_values": payload_for_row(row, field_types, warning_set, upload_images=not dry_run, image_upload_cache=image_upload_cache),
+            })
 
     if delete_missing:
         for book_id, record in existing.items():
