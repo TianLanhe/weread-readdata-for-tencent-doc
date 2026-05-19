@@ -60,6 +60,7 @@ NUMBER_FIELDS = {
 MULTI_OPTION_FIELDS = {"分类", "一级分类"}
 OPTION_LIKE_FIELDS = {"是否可读", "是否已读完", "已读完年", "已读完年月"}
 DATE_FIELDS = {"阅读完成时间"}
+FETCH_EXISTING_FIELDS = ["bookId"]
 
 
 def eprint(*args):
@@ -82,6 +83,30 @@ def tencent_json(tool, args):
         data = json.loads(out)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"failed to parse mcporter output as JSON: {exc}\nraw: {out[:500]}")
+    if data.get("error"):
+        raise RuntimeError(json.dumps(data, ensure_ascii=False))
+    return data
+
+
+def tencent_json_resilient(tool, args):
+    """Call Tencent Docs MCP and tolerate malformed huge success JSON payloads.
+
+    Some smartsheet responses echo all submitted records. Long text containing
+    unescaped control characters may make mcporter output invalid JSON even
+    though the write itself has succeeded. For write tools, callers only need to
+    know whether MCP reported an explicit failure, so return a minimal success
+    marker when JSON parsing fails after a zero-exit command.
+    """
+    out = run_cmd([
+        "mcporter", "call", "tencent-docs", tool,
+        "--args", json.dumps(args, ensure_ascii=False),
+    ])
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        if '"error": ""' in out[:200]:
+            return {"error": "", "raw_json_parse_warning": True}
+        raise
     if data.get("error"):
         raise RuntimeError(json.dumps(data, ensure_ascii=False))
     return data
@@ -239,11 +264,11 @@ def string_to_bool(value):
 
 def make_field_value(field_name, value, field_types, warnings):
     field_type = (field_types.get(field_name) or {}).get("type")
-    if value is None:
-        value = ""
 
     entry = {"field": field_name}
     if field_type in {"number", "progress", "currency", "percentage"}:
+        if value is None or value == "":
+            return None
         entry["number_value"] = float(value or 0)
         if field_name in {"阅读时长（秒）"}:
             entry["number_value"] = int(entry["number_value"])
@@ -268,10 +293,14 @@ def make_field_value(field_name, value, field_types, warnings):
             warnings.add("字段“封面”为 image 类型，但微信读书只返回封面 URL；未写入封面图片字段。")
             return None
     elif field_type == "text":
+        if value is None:
+            value = ""
         if isinstance(value, list):
             value = ", ".join(str(item) for item in value)
         entry["text_value"] = text_value(value)
     elif not field_type and field_name in NUMBER_FIELDS:
+        if value is None or value == "":
+            return None
         entry["number_value"] = float(value or 0)
         if field_name in {"阅读时长（秒）"}:
             entry["number_value"] = int(entry["number_value"])
@@ -282,6 +311,8 @@ def make_field_value(field_name, value, field_types, warnings):
     elif not field_type and field_name == "封面" and isinstance(value, str) and value.startswith("http"):
         entry["url_value"] = url_value(str(value), "封面")
     else:
+        if value is None:
+            value = ""
         if isinstance(value, list):
             value = ", ".join(str(item) for item in value)
         entry["text_value"] = text_value(value)
@@ -318,6 +349,8 @@ def normalize_for_compare(value):
     if isinstance(value, float):
         return round(value, 6)
     if isinstance(value, list):
+        if len(value) == 1:
+            return normalize_for_compare(value[0])
         return sorted(str(item) for item in value)
     if isinstance(value, bool):
         return "是" if value else "否"
@@ -331,9 +364,11 @@ def fetch_existing_records(file_id, sheet_id):
         data = tencent_json("smartsheet.list_records", {
             "file_id": file_id,
             "sheet_id": sheet_id,
-            "field_titles": REQUIRED_FIELDS,
+            # 只读取 bookId 定位记录。腾讯 MCP 在读取长文本/复杂选项字段时偶发输出非法 JSON；
+            # 写入时仍会提交完整字段。为保证空数字字段能被真正清空，已存在记录会重建。
+            "field_titles": FETCH_EXISTING_FIELDS,
             "offset": offset,
-            "limit": 100,
+            "limit": 20,
         })
         records = data.get("records") or []
         for record in records:
@@ -394,6 +429,10 @@ def get_book_detail(book_id):
     return weread_call({"api_name": "/book/info", "bookId": book_id})
 
 
+def get_book_progress(book_id):
+    return weread_call({"api_name": "/book/getprogress", "bookId": book_id})
+
+
 def batch_get_book_details(book_ids, max_workers=10):
     details = {}
     if not book_ids:
@@ -405,6 +444,22 @@ def batch_get_book_details(book_ids, max_workers=10):
             book_id = future_to_book[future]
             details[book_id] = future.result()
     return details
+
+
+def batch_get_book_progresses(book_ids, max_workers=10):
+    progresses = {}
+    if not book_ids:
+        return progresses
+    workers = max(1, int(max_workers or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_book = {executor.submit(get_book_progress, book_id): book_id for book_id in book_ids}
+        for future in concurrent.futures.as_completed(future_to_book):
+            book_id = future_to_book[future]
+            try:
+                progresses[book_id] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                progresses[book_id] = {"error": str(exc)}
+    return progresses
 
 
 def get_category_titles(item):
@@ -449,6 +504,53 @@ def yes_no(value):
     return "是" if value else "否"
 
 
+def first_number(*values):
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def normalize_price(*values):
+    price = first_number(*values)
+    if price is None:
+        return None
+    # 微信读书部分接口价格以“分”为单位；异常大的值按分转元，已是元的小数保持原样。
+    if price >= 100:
+        price = price / 100
+    return round(price, 2)
+
+
+def normalize_rating(value):
+    rating = first_number(value)
+    if rating is None or rating <= 0:
+        return None
+    # /book/info 的 newRating 常见为千分制分数，如 826 表示 8.26 分。
+    # 兼容少量已换算成百分制/十分制的输入，统一写入 0-10 分。
+    if rating > 100:
+        rating = rating / 100
+    elif rating > 10:
+        rating = rating / 10
+    return round(rating, 1)
+
+
+def normalize_words(*values):
+    words = first_number(*values)
+    if words is None or words <= 0:
+        return None
+    return round(words / 10000, 2)
+
+
+def progress_book(progresses, book_id):
+    progress = progresses.get(book_id) or {}
+    book = progress.get("book") if isinstance(progress, dict) else None
+    return book or {}
+
+
 def finish_year(finish_time_ms):
     if not finish_time_ms:
         return ""
@@ -461,7 +563,8 @@ def finish_year_month(finish_time_ms):
     return dt.datetime.fromtimestamp(int(finish_time_ms) / 1000).strftime("%Y年%m月")
 
 
-def build_books_from_weread(shelf, details, finished_books):
+def build_books_from_weread(shelf, details, finished_books, progresses=None):
+    progresses = progresses or {}
     book_progress = {}
     for progress in shelf.get("bookProgress") or []:
         book_id = str(progress.get("bookId") or "")
@@ -486,23 +589,28 @@ def build_books_from_weread(shelf, details, finished_books):
         if not book_id:
             continue
         detail = details.get(book_id) or {}
+        progress_detail = progress_book(progresses, book_id)
+        merged_progress = {**(book_progress.get(book_id) or {}), **progress_detail}
         categories = get_category_titles(item)
         if not categories:
             categories = get_category_titles(detail)
-        read_time = int((book_progress.get(book_id) or {}).get("readingTime") or 0)
-        progress = float((book_progress.get(book_id) or {}).get("progress") or 0) / 100
+        read_time = int(first_number(merged_progress.get("readingTime"), merged_progress.get("recordReadingTime")) or 0)
+        progress = min(max(first_number(merged_progress.get("progress")) or 0, 0), 100) / 100
         finish_time_ms = finish_times.get(book_id, 0)
-        if finish_time_ms:
+        if not finish_time_ms and int(merged_progress.get("finishTime") or 0) > 0:
+            finish_time_ms = int(merged_progress.get("finishTime")) * 1000
+        is_finished = bool(item.get("finishReading") == 1 or progress >= 1 or finish_time_ms)
+        if is_finished:
             progress = 1
-        score = float(detail.get("newRating") or 0) / 10
-        words = float(detail.get("totalWords") or detail.get("wordCount") or 0) / 10000
+        score = normalize_rating(detail.get("newRating"))
+        words = normalize_words(detail.get("totalWords"), detail.get("wordCount"))
         can_read = item.get("paid") == 1 or item.get("payingStatus") != 2
         rows[book_id] = book_to_row(
             book_id=book_id,
             title=item.get("title") or detail.get("title") or "",
             author=item.get("author") or detail.get("author") or "",
             cover=item.get("cover") or detail.get("cover") or "",
-            price=float(item.get("price") or detail.get("price") or 0),
+            price=normalize_price(item.get("price"), detail.get("price")),
             can_read=can_read,
             categories=categories,
             read_time=read_time,
@@ -512,6 +620,7 @@ def build_books_from_weread(shelf, details, finished_books):
             words=words,
             progress=progress,
             finish_time_ms=finish_time_ms,
+            is_finished=is_finished,
         )
 
     for book_id, item in finished_books.items():
@@ -521,14 +630,14 @@ def build_books_from_weread(shelf, details, finished_books):
         categories = get_category_titles(detail)
         read_time = int(item.get("readtime") or 0)
         finish_time_ms = int(item.get("finishTime") or 0) * 1000
-        score = float(detail.get("newRating") or 0) / 10
-        words = float(detail.get("totalWords") or detail.get("wordCount") or 0) / 10000
+        score = normalize_rating(detail.get("newRating"))
+        words = normalize_words(detail.get("totalWords"), detail.get("wordCount"))
         rows[book_id] = book_to_row(
             book_id=book_id,
             title=item.get("title") or detail.get("title") or "",
             author=item.get("author") or detail.get("author") or "",
             cover=item.get("cover") or detail.get("cover") or "",
-            price=float(detail.get("price") or 0),
+            price=normalize_price(detail.get("price")),
             can_read=True,
             categories=categories,
             read_time=read_time,
@@ -538,13 +647,14 @@ def build_books_from_weread(shelf, details, finished_books):
             words=words,
             progress=1,
             finish_time_ms=finish_time_ms,
+            is_finished=True,
         )
     return rows
 
 
-def book_to_row(book_id, title, author, cover, price, can_read, categories, read_time, shelf_name, score, intro, words, progress, finish_time_ms):
+def book_to_row(book_id, title, author, cover, price, can_read, categories, read_time, shelf_name, score, intro, words, progress, finish_time_ms, is_finished=None):
     read_time = int(read_time or 0)
-    finish_read = finish_time_ms > 0
+    finish_read = bool(is_finished) if is_finished is not None else finish_time_ms > 0
     return {
         "bookId": book_id,
         "书名": title,
@@ -554,13 +664,13 @@ def book_to_row(book_id, title, author, cover, price, can_read, categories, read
         "分类": categories or [],
         "一级分类": first_level_categories(categories),
         "是否可读": yes_no(can_read),
-        "评分": float(score or 0),
+        "评分": score,
         "阅读时长（秒）": read_time,
         "阅读时长（时）": float(read_time) / 3600,
         "阅读时长（分）": float(read_time) / 60,
         "阅读时长格式化": format_read_time(read_time),
         "封面": cover or "",
-        "字数（单位：万字）": float(words or 0),
+        "字数（单位：万字）": words,
         "简介": intro or "",
         "阅读进度": float(progress or 0),
         "是否已读完": yes_no(finish_read),
@@ -571,7 +681,11 @@ def book_to_row(book_id, title, author, cover, price, can_read, categories, read
 
 
 def extract_book_rows(max_workers=10):
-    _, _, finished_books = get_mine_read_books()
+    try:
+        _, _, finished_books = get_mine_read_books()
+    except Exception as exc:  # noqa: BLE001
+        eprint(f"WARN: failed to fetch /mine/readbook, fallback to bookshelf only: {exc}")
+        finished_books = {}
     shelf = get_shelf()
     book_ids = []
     seen = set()
@@ -585,7 +699,8 @@ def extract_book_rows(max_workers=10):
             book_ids.append(book_id)
             seen.add(book_id)
     details = batch_get_book_details(book_ids, max_workers=max_workers)
-    rows_by_id = build_books_from_weread(shelf, details, finished_books)
+    progresses = batch_get_book_progresses(book_ids, max_workers=max_workers)
+    rows_by_id = build_books_from_weread(shelf, details, finished_books, progresses=progresses)
     return [rows_by_id[key] for key in sorted(rows_by_id, key=lambda k: rows_by_id[k].get("书名") or k)]
 
 
@@ -600,10 +715,27 @@ def payload_for_row(row, field_types, warnings):
 
 def row_changed(existing_fields, target):
     for field in REQUIRED_FIELDS:
-        if field == "封面":
-            # 图片字段可能无法从 URL 反向比较；封面不作为关键变更判断。
+        if field in {"封面", "简介"}:
+            # 图片字段可能无法从 URL 反向比较；长简介不参与轻量比较，避免读取时 JSON 过大。
             continue
         if normalize_for_compare(existing_fields.get(field)) != normalize_for_compare(target.get(field)):
+            return True
+    return False
+
+
+def should_recreate_record(existing_fields, target):
+    """Whether update cannot make the existing record correct.
+
+    Tencent SmartSheet numeric/currency/progress fields cannot be reliably cleared
+    by updating them to null/empty. If previous runs wrote placeholder 0 but the
+    source actually has no value, recreate the row so omitted fields stay blank.
+    """
+    if set(existing_fields.keys()) <= {"bookId"}:
+        return True
+    for field in NUMBER_FIELDS:
+        if field in {"阅读时长（秒）", "阅读时长（时）", "阅读时长（分）", "阅读进度"}:
+            continue
+        if target.get(field) is None and existing_fields.get(field) not in (None, ""):
             return True
     return False
 
@@ -627,11 +759,18 @@ def upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=False, d
     warning_set = set()
     rows_to_create = []
     rows_to_update = []
+    record_ids_to_delete = []
     row_ids = {row["bookId"] for row in rows}
 
     for row in rows:
         book_id = row["bookId"]
         if book_id in existing:
+            if should_recreate_record(existing[book_id]["fields"], row):
+                record_id = existing[book_id].get("record_id")
+                if record_id:
+                    record_ids_to_delete.append(record_id)
+                rows_to_create.append({"field_values": payload_for_row(row, field_types, warning_set)})
+                continue
             if not row_changed(existing[book_id]["fields"], row):
                 summary["skipped"] += 1
                 continue
@@ -641,7 +780,6 @@ def upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=False, d
         else:
             rows_to_create.append({"field_values": payload_for_row(row, field_types, warning_set)})
 
-    record_ids_to_delete = []
     if delete_missing:
         for book_id, record in existing.items():
             if book_id not in row_ids and record.get("record_id"):
@@ -654,24 +792,25 @@ def upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=False, d
         summary["deleted"] = len(record_ids_to_delete)
         return summary
 
-    for batch in chunked(rows_to_update, 100):
-        tencent_json("smartsheet.update_records", {"file_id": file_id, "sheet_id": sheet_id, "records": batch})
-        summary["updated"] += len(batch)
-        summary["updated_record_ids"].extend([item["record_id"] for item in batch])
-        time.sleep(0.3)
-
-    for batch in chunked(rows_to_create, 100):
-        data = tencent_json("smartsheet.add_records", {"file_id": file_id, "sheet_id": sheet_id, "records": batch})
-        created_records = data.get("records") or []
-        summary["created"] += len(batch)
-        summary["created_record_ids"].extend([item.get("record_id") for item in created_records if item.get("record_id")])
-        time.sleep(0.3)
-
     for batch in chunked(record_ids_to_delete, 100):
         tencent_json("smartsheet.delete_records", {"file_id": file_id, "sheet_id": sheet_id, "record_ids": batch})
         summary["deleted"] += len(batch)
         summary["deleted_record_ids"].extend(batch)
         time.sleep(0.3)
+
+    for batch in chunked(rows_to_update, 100):
+        tencent_json_resilient("smartsheet.update_records", {"file_id": file_id, "sheet_id": sheet_id, "records": batch})
+        summary["updated"] += len(batch)
+        summary["updated_record_ids"].extend([item["record_id"] for item in batch])
+        time.sleep(0.3)
+
+    for batch in chunked(rows_to_create, 100):
+        data = tencent_json_resilient("smartsheet.add_records", {"file_id": file_id, "sheet_id": sheet_id, "records": batch})
+        created_records = data.get("records") or []
+        summary["created"] += len(batch)
+        summary["created_record_ids"].extend([item.get("record_id") for item in created_records if item.get("record_id")])
+        time.sleep(0.3)
+
     return summary
 
 
@@ -775,7 +914,7 @@ def main():
         fields = fetch_fields(file_id, sheet_id)
         field_types = validate_fields(fields)
         existing = fetch_existing_records(file_id, sheet_id)
-        summary = upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=args.dry_run, delete_missing=args.delete_missing)
+        summary = upsert_rows(file_id, sheet_id, rows, existing, field_types, dry_run=args.dry_run, delete_missing=(args.delete_missing or args.init_smartsheet))
         mode = "dry_run" if args.dry_run else "sync"
 
     output = {
