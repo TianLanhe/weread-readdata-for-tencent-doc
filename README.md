@@ -24,24 +24,56 @@
 
 ## 安装指引
 
-可以直接用 `curl` 下载并安装到本机 skill 目录：
+下面提供两种安装方式：
+
+### 方式一：Shell 明确下载并安装到 `.agent` 目录
+
+适合希望自己控制安装路径和安装过程的用户。下面命令会把 skill 安装到 `${HOME}/.agent/skills/weread-readdata-for-tencent-doc`：
 
 ```bash
 SKILL_NAME="weread-readdata-for-tencent-doc"
-INSTALL_DIR="${HOME}/.trae/skills"
+DOWNLOAD_URL="https://github.com/TianLanhe/weread-readdata-for-tencent-doc/archive/refs/heads/main.tar.gz"
+INSTALL_ROOT="${HOME}/.agent/skills"
 TMP_DIR="$(mktemp -d)"
+ARCHIVE_PATH="${TMP_DIR}/${SKILL_NAME}.tar.gz"
 
-mkdir -p "${INSTALL_DIR}"
-curl -L "https://github.com/TianLanhe/weread-readdata-for-tencent-doc/archive/refs/heads/main.tar.gz" | tar -xz -C "${TMP_DIR}"
-rm -rf "${INSTALL_DIR}/${SKILL_NAME}"
-mv "${TMP_DIR}/${SKILL_NAME}-main" "${INSTALL_DIR}/${SKILL_NAME}"
+# 1. 创建安装目录
+mkdir -p "${INSTALL_ROOT}"
+
+# 2. 下载 skill 压缩包
+curl -L "${DOWNLOAD_URL}" -o "${ARCHIVE_PATH}"
+
+# 3. 解压到临时目录
+tar -xzf "${ARCHIVE_PATH}" -C "${TMP_DIR}"
+
+# 4. 安装到 ~/.agent/skills/<skill-name>
+rm -rf "${INSTALL_ROOT}/${SKILL_NAME}"
+mv "${TMP_DIR}/${SKILL_NAME}-main" "${INSTALL_ROOT}/${SKILL_NAME}"
+
+# 5. 简单校验并清理临时文件
+test -f "${INSTALL_ROOT}/${SKILL_NAME}/SKILL.md"
 rm -rf "${TMP_DIR}"
 ```
 
-
 安装完成后，可让支持 skills 的 agent / CLI 重新加载 skills，或开启新会话使用 `weread-readdata-for-tencent-doc`。
 
-你也可以把上面的安装指令直接交给 agents，让 agents 帮你自动下载并安装这个 skill。
+### 方式二：把下载地址交给 agent 自动安装
+
+下载地址：
+
+```text
+https://github.com/TianLanhe/weread-readdata-for-tencent-doc/archive/refs/heads/main.tar.gz
+```
+
+可以把下面这段提示词直接交给你的 agent，让 agent 根据当前运行环境判断下载方式、安装方式以及合适的安装位置：
+
+```text
+请帮我安装这个 skill：weread-readdata-for-tencent-doc
+
+下载地址：https://github.com/TianLanhe/weread-readdata-for-tencent-doc/archive/refs/heads/main.tar.gz
+
+请根据你所在的 Agent/CLI 环境，判断应该如何下载、解压和安装这个 skill，并选择合适的 skill 安装位置。如果当前环境没有特殊约定，请优先考虑安装到用户级 agent skill 目录。安装完成后，请确认 SKILL.md 存在，并告诉我最终安装路径。
+```
 
 ## 使用方式
 
