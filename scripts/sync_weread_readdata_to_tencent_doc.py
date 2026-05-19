@@ -15,8 +15,8 @@ from urllib import parse, request
 
 
 # 微信读书数据统一通过 weread-skill 暴露的 Agent API Gateway 读取。
-# 这里的 /shelf/sync、/mine/readbook、/book/info 等是 gateway 的 api_name，
-# 不直接请求微信读书原生/raw API。
+# 这里的 /shelf/sync、/book/info、/book/getprogress、/book/chapterinfo 等
+# 是 gateway 的 api_name，不直接请求微信读书原生/raw API。
 WEREAD_SKILL_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
 WEREAD_SKILL_VERSION = "1.0.3"
 SSL_CTX = ssl._create_unverified_context()
@@ -402,39 +402,6 @@ def get_shelf():
     return weread_call({"api_name": "/shelf/sync"})
 
 
-def get_mine_read_books():
-    maxidx = 0
-    all_books = []
-    finished = {}
-    reading = {}
-    while True:
-        data = weread_call({
-            "api_name": "/mine/readbook",
-            "count": 100,
-            "rating": 0,
-            "star": 0,
-            "listType": 3,
-            "yearRange": "0_0",
-            "maxidx": maxidx,
-        })
-        read_books = data.get("readBooks") or []
-        for book in read_books:
-            all_books.append(book)
-            book_id = str(book.get("bookId") or "")
-            if not book_id:
-                continue
-            if book.get("markStatus") == 4:
-                finished[book_id] = book
-            elif book.get("markStatus") == 2:
-                reading[book_id] = book
-        if not data.get("hasMore"):
-            break
-        maxidx += len(read_books)
-        if not read_books:
-            break
-    return all_books, reading, finished
-
-
 def get_book_detail(book_id):
     return weread_call({"api_name": "/book/info", "bookId": book_id})
 
@@ -770,7 +737,7 @@ def finish_year_month(finish_time_ms):
     return dt.datetime.fromtimestamp(int(finish_time_ms) / 1000).strftime("%Y年%m月")
 
 
-def build_books_from_weread(shelf, details, finished_books, progresses=None, chapter_infos=None, user_is_paid_member=False):
+def build_books_from_weread(shelf, details, progresses=None, chapter_infos=None, user_is_paid_member=False):
     progresses = progresses or {}
     chapter_infos = chapter_infos or {}
     book_progress = {}
@@ -784,12 +751,6 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None, cha
         name = archive.get("name") or ""
         for book_id in archive.get("bookIds") or []:
             shelf_names[str(book_id)] = name
-
-    finish_times = {}
-    for book_id, book in finished_books.items():
-        finish_time = int(book.get("finishTime") or 0)
-        if finish_time > 0:
-            finish_times[book_id] = finish_time * 1000
 
     rows = {}
     for item in shelf.get("books") or shelf.get("book") or []:
@@ -805,8 +766,8 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None, cha
             categories, first_level = get_category_titles(detail)
         read_time = int(first_number(merged_progress.get("readingTime"), merged_progress.get("recordReadingTime")) or 0)
         progress = min(max(first_number(merged_progress.get("progress")) or 0, 0), 100) / 100
-        finish_time_ms = finish_times.get(book_id, 0)
-        if not finish_time_ms and int(merged_progress.get("finishTime") or 0) > 0:
+        finish_time_ms = 0
+        if int(merged_progress.get("finishTime") or 0) > 0:
             finish_time_ms = int(merged_progress.get("finishTime")) * 1000
         is_finished = bool(item.get("finishReading") == 1 or progress >= 1 or finish_time_ms)
         if is_finished:
@@ -831,35 +792,6 @@ def build_books_from_weread(shelf, details, finished_books, progresses=None, cha
             progress=progress,
             finish_time_ms=finish_time_ms,
             is_finished=is_finished,
-        )
-
-    for book_id, item in finished_books.items():
-        if book_id in rows:
-            continue
-        detail = details.get(book_id) or {}
-        chapter_info = chapter_infos.get(book_id) or {}
-        categories, first_level = get_category_titles(detail)
-        read_time = int(item.get("readtime") or 0)
-        finish_time_ms = int(item.get("finishTime") or 0) * 1000
-        score = normalize_rating(detail.get("newRating"))
-        words = normalize_words(detail.get("totalWords"), detail.get("wordCount"))
-        rows[book_id] = book_to_row(
-            book_id=book_id,
-            title=item.get("title") or detail.get("title") or "",
-            author=item.get("author") or detail.get("author") or "",
-            cover=item.get("cover") or detail.get("cover") or "",
-            price=normalize_price(detail.get("price")),
-            can_read=infer_can_read(item, detail=detail, chapter_info=chapter_info, user_is_paid_member=user_is_paid_member),
-            categories=categories,
-            first_level_categories_value=first_level,
-            read_time=read_time,
-            shelf_name="",
-            score=score,
-            intro=detail.get("intro") or "",
-            words=words,
-            progress=1,
-            finish_time_ms=finish_time_ms,
-            is_finished=True,
         )
     return rows
 
@@ -893,11 +825,6 @@ def book_to_row(book_id, title, author, cover, price, can_read, categories, read
 
 
 def extract_book_rows(max_workers=10):
-    try:
-        _, _, finished_books = get_mine_read_books()
-    except Exception as exc:  # noqa: BLE001
-        eprint(f"WARN: failed to fetch /mine/readbook, fallback to bookshelf only: {exc}")
-        finished_books = {}
     shelf = get_shelf()
     book_ids = []
     seen = set()
@@ -906,18 +833,13 @@ def extract_book_rows(max_workers=10):
         if book_id and book_id not in seen:
             book_ids.append(book_id)
             seen.add(book_id)
-    for book_id in finished_books:
-        if book_id and book_id not in seen:
-            book_ids.append(book_id)
-            seen.add(book_id)
     details = batch_get_book_details(book_ids, max_workers=max_workers)
     progresses = batch_get_book_progresses(book_ids, max_workers=max_workers)
     chapter_infos = batch_get_book_chapterinfos(book_ids, max_workers=max_workers)
-    user_is_paid_member = detect_user_is_paid_member(shelf, details, finished_books, progresses)
+    user_is_paid_member = detect_user_is_paid_member(shelf, details, progresses, chapter_infos)
     rows_by_id = build_books_from_weread(
         shelf,
         details,
-        finished_books,
         progresses=progresses,
         chapter_infos=chapter_infos,
         user_is_paid_member=user_is_paid_member,
@@ -1124,17 +1046,17 @@ def rows_to_markdown(rows, limit=50):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read WeRead bookshelf/finished books and optionally sync them into Tencent Docs SmartSheet.")
+    parser = argparse.ArgumentParser(description="Read WeRead bookshelf data and optionally sync it into Tencent Docs SmartSheet.")
     parser.add_argument("--table-url", help="Tencent Docs SmartSheet URL containing file_id and optionally sheet_id")
     parser.add_argument("--file-id", help="Tencent Docs SmartSheet file_id")
     parser.add_argument("--sheet-id", help="Tencent Docs SmartSheet sheet_id")
     parser.add_argument("--dry-run", action="store_true", help="compute sync result but do not write records")
     parser.add_argument("--print-only", action="store_true", help="only read and print markdown table; skip all SmartSheet operations")
     parser.add_argument("--init-smartsheet", action="store_true", help="copy the Tencent SmartSheet template and sync into its 书籍列表 sheet")
-    parser.add_argument("--file-name", default="微信读书书架", help="Tencent SmartSheet file name used with --init-smartsheet")
+    parser.add_argument("--file-name", default="微信读书书架书单", help="Tencent SmartSheet file name used with --init-smartsheet")
     parser.add_argument("--folder-id", help="optional folder id for the copied SmartSheet")
-    parser.add_argument("--delete-missing", action="store_true", help="delete records whose bookId no longer exists in WeRead merged book list")
-    parser.add_argument("--max-workers", type=int, default=10, help="parallel workers for /book/info calls")
+    parser.add_argument("--delete-missing", action="store_true", help="delete records whose bookId no longer exists in the WeRead bookshelf list")
+    parser.add_argument("--max-workers", type=int, default=10, help="parallel workers for WeRead detail/progress calls")
     args = parser.parse_args()
 
     if args.print_only and args.init_smartsheet:

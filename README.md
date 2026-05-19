@@ -1,12 +1,12 @@
 # weread-readdata-for-tencent-doc
 
-微信读书书架/已读完列表同步到腾讯文档智能表格。
+微信读书书架数据同步到腾讯文档智能表格。
 
 ## Skill 介绍
 
-读取微信读书书架与已读完列表，合并成“书籍列表”，可直接打印为 Markdown 表格，也可按 `bookId` upsert 到腾讯文档智能表格。
+读取微信读书书架数据，整理成“书籍列表”，可直接打印为 Markdown 表格，也可按 `bookId` upsert 到腾讯文档智能表格。
 
-适用场景：读取微信读书书架、已读完列表，或同步书籍列表到腾讯文档智能表格。
+适用场景：读取微信读书书架数据，或同步书籍列表到腾讯文档智能表格。
 
 仓库内容按 Trae / Claude Code skill 目录组织，核心入口是 [`SKILL.md`](./SKILL.md)，脚本与资源放在 `scripts/`、`references/`、`assets/` 等目录中。
 
@@ -79,7 +79,7 @@ https://github.com/TianLanhe/weread-readdata-for-tencent-doc/archive/refs/heads/
 
 安装后，用自然语言向 agent 描述你的目标即可，例如：
 
-- “帮我读取微信读书书架、已读完列表，或同步书籍列表到腾讯文档智能表格。”
+- “帮我读取微信读书书架，或同步书籍列表到腾讯文档智能表格。”
 - “先只读取并打印结果，不要写入文档”
 - “同步到我提供的目标表，并做 dry-run 预览”
 
