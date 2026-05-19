@@ -297,3 +297,8 @@ python3 ${HOME}/.trae/skills/weread-readdata-for-tencent-doc/scripts/sync_weread
 - 书籍唯一键始终是 `bookId`，不要用书名做 upsert 主键。
 - `--delete-missing` 有删除风险，只有用户明确说“完全同步 / 删除不在微信读书里的旧记录 / 与微信读书保持一致”时才使用。
 - 当用户误把其他 token 当成 `sheet_id` 传入，或链接里没有 `sheet_id` 时，要自动扫描整个腾讯智能表格找到真正可写的 `书籍列表` 工作表，而不是直接报错结束。
+- `scripts/sync_weread_readdata_to_tencent_doc.py` 只允许包含两类逻辑：
+  1. 通过 `weread-skill` 能力读取微信读书书架、阅读进度、书籍详情，并进行字段合并
+  2. 腾讯文档智能表格写入 / 从固定模板复制新智能表格与其直接相关的最小逻辑
+- 不要把 skill 安装、MCP 安装、依赖检测、环境探测、升级向导等非核心流程写进这个 Python 脚本。
+- 后续如果要更新安装方式、依赖说明、触发条件、操作约束，优先修改 `SKILL.md`、`references/`、`assets/`，**不要因为这些非书籍数据获取 / 腾讯智能表格写入需求去改 Python 代码。**
