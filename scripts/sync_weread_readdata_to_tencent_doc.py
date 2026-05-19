@@ -35,6 +35,7 @@ REQUIRED_FIELDS = [
     "一级分类",
     "是否可读",
     "评分",
+    "推荐值",
     "阅读时长（秒）",
     "阅读时长（时）",
     "阅读时长（分）",
@@ -280,6 +281,8 @@ def make_field_value(field_name, value, field_types, warnings):
         if value is None or value == "":
             return None
         entry["number_value"] = float(value or 0)
+        if field_name == "阅读进度" and field_type == "percentage":
+            entry["number_value"] = entry["number_value"] / 100
         if field_name in {"阅读时长（秒）"}:
             entry["number_value"] = int(entry["number_value"])
     elif field_type == "checkbox":
@@ -476,19 +479,6 @@ def extract_titles(value):
     return [text] if text else []
 
 
-def expand_category_value(value):
-    expanded = []
-    seen = set()
-    for title in extract_titles(value):
-        parts = [part.strip() for part in re.split(r"\s*-\s*", title) if part and part.strip()]
-        candidates = parts if len(parts) > 1 else [title]
-        for item in candidates:
-            if item not in seen:
-                expanded.append(item)
-                seen.add(item)
-    return expanded
-
-
 def get_category_titles(item):
     categories = []
     first_levels = []
@@ -500,17 +490,17 @@ def get_category_titles(item):
         value = item.get(key)
         if value is None:
             continue
-        expanded = expand_category_value(value)
-        if not expanded:
+        titles = extract_titles(value)
+        if not titles:
             continue
-        first = expanded[0]
-        if first and first not in seen_first_levels:
-            first_levels.append(first)
-            seen_first_levels.add(first)
-        for category in expanded:
+        for category in titles:
             if category and category not in seen_categories:
                 categories.append(category)
                 seen_categories.add(category)
+            first = str(category).split("-")[0].strip()
+            if first and first not in seen_first_levels:
+                first_levels.append(first)
+                seen_first_levels.add(first)
     return categories, first_levels
 
 
@@ -703,13 +693,28 @@ def normalize_rating(value):
     rating = first_number(value)
     if rating is None or rating <= 0:
         return None
-    # /book/info 的 newRating 常见为千分制分数，如 826 表示 8.26 分。
-    # 兼容少量已换算成百分制/十分制的输入，统一写入 0-10 分。
-    if rating > 100:
-        rating = rating / 100
-    elif rating > 10:
-        rating = rating / 10
+    # /book/info 的 newRating 是放大 10 倍后的评分值。
+    # 例如 826 表示 82.6 分，统一保留 1 位小数。
+    rating = rating / 10
     return round(rating, 1)
+
+
+def chapter_word_count(chapter_info):
+    if not isinstance(chapter_info, dict):
+        return None
+    total = 0
+    found = False
+    for chapter in chapter_info.get("chapters") or []:
+        word_count = first_number(
+            chapter.get("wordCount"),
+            chapter.get("words"),
+            chapter.get("totalWords"),
+        )
+        if word_count is None or word_count <= 0:
+            continue
+        total += int(word_count)
+        found = True
+    return total if found else None
 
 
 def normalize_words(*values):
@@ -717,6 +722,16 @@ def normalize_words(*values):
     if words is None or words <= 0:
         return None
     return round(words / 10000, 2)
+
+
+def extract_recommend_title(detail):
+    title = value_from_paths(detail, "newRatingDetail.title")
+    if title is None:
+        return ""
+    if isinstance(title, (list, tuple)):
+        text = " / ".join(str(item).strip() for item in title if str(item).strip())
+        return text
+    return str(title).strip()
 
 
 def progress_book(progresses, book_id):
@@ -765,15 +780,20 @@ def build_books_from_weread(shelf, details, progresses=None, chapter_infos=None,
         if not categories:
             categories, first_level = get_category_titles(detail)
         read_time = int(first_number(merged_progress.get("readingTime"), merged_progress.get("recordReadingTime")) or 0)
-        progress = min(max(first_number(merged_progress.get("progress")) or 0, 0), 100) / 100
+        progress = min(max(first_number(merged_progress.get("progress")) or 0, 0), 100)
         finish_time_ms = 0
         if int(merged_progress.get("finishTime") or 0) > 0:
             finish_time_ms = int(merged_progress.get("finishTime")) * 1000
-        is_finished = bool(item.get("finishReading") == 1 or progress >= 1 or finish_time_ms)
+        is_finished = bool(item.get("finishReading") == 1 or progress >= 100 or finish_time_ms)
         if is_finished:
-            progress = 1
+            progress = 100
         score = normalize_rating(detail.get("newRating"))
-        words = normalize_words(detail.get("totalWords"), detail.get("wordCount"))
+        words = normalize_words(
+            detail.get("totalWords"),
+            detail.get("wordCount"),
+            chapter_word_count(chapter_info),
+        )
+        recommend_value = extract_recommend_title(detail)
         can_read = infer_can_read(item, detail=detail, chapter_info=chapter_info, user_is_paid_member=user_is_paid_member)
         rows[book_id] = book_to_row(
             book_id=book_id,
@@ -787,6 +807,7 @@ def build_books_from_weread(shelf, details, progresses=None, chapter_infos=None,
             read_time=read_time,
             shelf_name=shelf_names.get(book_id, ""),
             score=score,
+            recommend_value=recommend_value,
             intro=detail.get("intro") or "",
             words=words,
             progress=progress,
@@ -796,7 +817,7 @@ def build_books_from_weread(shelf, details, progresses=None, chapter_infos=None,
     return rows
 
 
-def book_to_row(book_id, title, author, cover, price, can_read, categories, read_time, shelf_name, score, intro, words, progress, finish_time_ms, is_finished=None, first_level_categories_value=None):
+def book_to_row(book_id, title, author, cover, price, can_read, categories, read_time, shelf_name, score, recommend_value, intro, words, progress, finish_time_ms, is_finished=None, first_level_categories_value=None):
     read_time = int(read_time or 0)
     finish_read = bool(is_finished) if is_finished is not None else finish_time_ms > 0
     return {
@@ -809,6 +830,7 @@ def book_to_row(book_id, title, author, cover, price, can_read, categories, read
         "一级分类": first_level_categories_value or first_level_categories(categories),
         "是否可读": yes_no(can_read),
         "评分": score,
+        "推荐值": recommend_value or "",
         "阅读时长（秒）": read_time,
         "阅读时长（时）": float(read_time) / 3600,
         "阅读时长（分）": float(read_time) / 60,

@@ -92,14 +92,6 @@ python3 --version
 mcporter list tencent-docs
 ```
 
-重要限制：
-
-- `scripts/sync_weread_readdata_to_tencent_doc.py` 只允许包含两类逻辑：
-  1. 通过 `weread-skill` 能力读取微信读书书架、阅读进度、书籍详情，并进行字段合并
-  2. 腾讯文档智能表格写入 / 从固定模板复制新智能表格与其直接相关的最小逻辑
-- 不要把 skill 安装、MCP 安装、依赖检测、环境探测、升级向导等非核心流程写进这个 Python 脚本。
-- 后续如果要更新安装方式、依赖说明、触发条件、操作约束，优先修改 `SKILL.md`、`references/`、`assets/`，**不要因为这些非书籍数据获取 / 腾讯智能表格写入需求去改 Python 代码。**
-
 ## 何时触发
 
 下列请求都应该触发这个 skill：
@@ -173,28 +165,7 @@ mcporter list tencent-docs
 
 ## 数据来源与口径
 
-书籍列表来自以下四类微信读书数据，合并口径已固化在本 skill 中。
-
-重要：下面的 `/shelf/sync`、`/book/info`、`/book/getprogress`、`/book/chapterinfo` 是传给 `weread-skill` Agent API Gateway 的 `api_name` 能力名，不代表脚本可以直接访问微信读书原生接口。实现时统一调用 `https://i.weread.qq.com/api/agent/gateway`，由 `weread-skill` 负责读取微信读书数据：
-
-1. `/shelf/sync`：读取书架电子书列表、书架分组 `archive`、阅读进度 `bookProgress`。
-2. `/book/info`：按 `bookId` 批量补齐简介、字数、评分、分类等详情。
-3. `/book/getprogress`：按 `bookId` 补齐阅读时长、阅读进度、完成时间等阅读进度信息。
-4. `/book/chapterinfo`：按 `bookId` 补齐章节是否免费、是否已购买等信息；用于更准确判断 `是否可读`。
-
-关键口径：
-
-- 书籍唯一键是 `bookId`。
-- 当前以 `/shelf/sync` 返回的书架书籍为全集。
-- 书架分类来自 `/shelf/sync` 的 `archive[].name` 与 `archive[].bookIds`。
-- 阅读时长来自书架 `bookProgress[].readingTime` 或 `/book/getprogress` 返回的阅读时长字段，单位是 **秒**。
-- 阅读进度来自 `bookProgress[].progress / 100` 或 `/book/getprogress` 的 `progress / 100`。
-- `finishTime` 来自书架进度或 `/book/getprogress`，写入腾讯智能表格前统一转为毫秒级时间戳。
-- `评分 = newRating / 10`。
-- `字数（单位：万字） = totalWords / 10000`。
-- `分类` 会把微信读书返回的层级分类（如 `历史-中国古代`）拆成多个选项并去重写入。
-- `一级分类` 是按原始层级分类提取每条分类路径的第一段后去重得到。
-- `是否可读` 口径：若已知当前用户为付费会员，则全部记为可读；否则仅当整本书免费可读、支持体验卡阅读、或付费章节均已购买时记为可读。当前环境如果无法从网关回包中直接判断会员状态，可通过环境变量 `WEREAD_IS_PAID_MEMBER=1` 显式指定。
+所有微信读书数据都通过 `weread-skill` 的 Agent API Gateway 获取，不直接请求微信读书原生接口。字段推导、回退策略、可读性判断、进度换算与写入细节以脚本实现为准；SKILL.md 只保留使用方式、触发条件和目标表要求。
 
 ## 目标表结构要求
 
@@ -209,6 +180,7 @@ mcporter list tencent-docs
 - `一级分类`
 - `是否可读`
 - `评分`
+- `推荐值`
 - `阅读时长（秒）`
 - `阅读时长（时）`
 - `阅读时长（分）`
@@ -222,7 +194,7 @@ mcporter list tencent-docs
 - `已读完年`
 - `已读完年月`
 
-在写入已有工作表前，先执行字段存在性校验；字段缺失就停止。腾讯智能表格中的公式 / 计算类字段不需要也不应该由脚本写入，例如模板中的 `推荐值`、`每小时阅读字数（万）`、`每小时阅读字数（统计用）`、`字数（统计用）`；`阅读顺序` 当前也不由脚本写入，除非后续明确排序口径。由于不同模板可能把 `分类`、`是否可读`、`封面` 等设计为文本、选项、URL 或图片字段，脚本按实际字段类型写入；如果 `封面` 是 `image` 类型，脚本会先下载微信读书封面并调用腾讯文档 `upload_image` 上传，再把返回的 `image_id` 写入图片字段。
+在写入已有工作表前，先执行字段存在性校验；字段缺失就停止。腾讯智能表格中的公式 / 计算类字段仍不应写入，例如模板中的 `每小时阅读字数（万）`、`每小时阅读字数（统计用）`、`字数（统计用）`；`阅读顺序` 当前也不由脚本写入，除非后续明确排序口径。其余字段的具体取值与写入格式以脚本实现为准。
 
 ## 推荐执行命令
 
@@ -272,7 +244,7 @@ python3 ${HOME}/.trae/skills/weread-readdata-for-tencent-doc/scripts/sync_weread
 --file-id <id>                # 腾讯文档智能表格 file_id
 --sheet-id <id>               # 工作表 sheet_id
 --init-smartsheet             # 从固定模板复制腾讯智能表格副本，并把数据写入其“书籍列表”工作表
---file-name <name>            # 复制后的腾讯智能表格名字，默认“微信读书书架”
+--file-name <name>            # 复制后的腾讯智能表格名字，默认“微信读书书架书单”
 --folder-id <id>              # 可选，把副本放到指定文件夹
 --dry-run                     # 只计算 upsert / delete 结果，不实际写入已有腾讯智能表格
 --delete-missing              # 删除目标表中 bookId 已不在微信读书合并列表里的旧记录；需要用户明确要求或确认
@@ -287,30 +259,7 @@ python3 ${HOME}/.trae/skills/weread-readdata-for-tencent-doc/scripts/sync_weread
 - 已给腾讯智能表格 -> 直接校验并写入
 - 要写入但没给腾讯智能表格 -> 先问是否从固定模板复制腾讯智能表格
 
-### 2. 读取并合并书籍数据
-
-- 通过 `weread-skill` Agent API Gateway 调 `/shelf/sync` 读取书架、书架分类、基础阅读进度
-- 通过 `weread-skill` Agent API Gateway 批量调 `/book/info` 补齐详情字段
-- 通过 `weread-skill` Agent API Gateway 批量调 `/book/getprogress` 补齐阅读时长、进度与完成时间
-- 通过 `weread-skill` Agent API Gateway 批量调 `/book/chapterinfo` 辅助判断 `是否可读`
-
-### 3. 如需写入，解析并校验目标工作表
-
-- 若用户给的是 URL，从中提取 `file_id` 和可选 `sheet_id`
-- 若 `sheet_id` 缺失或格式不合法，则遍历整个腾讯智能表格自动寻找符合表头要求的工作表
-- 读取字段结构
-- 确认必需字段都存在
-
-### 4. upsert 写入
-
-对每本书：
-
-- 不存在 -> 创建
-- 已存在但字段值变了 -> 更新
-- 已存在且值相同 -> 跳过
-- 只有在用户明确要求 `--delete-missing` 时，才删除目标表中不在微信读书合并列表里的旧 `bookId` 记录
-
-### 5. 返回结果
+### 2. 返回结果
 
 返回时至少说明：
 
